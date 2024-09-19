@@ -51,7 +51,7 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   console.log(`Executando consulta SQL com offset ${offset} e limite ${limit}`);
 
   const query = `
-    SELECT name, original_birth_date, mother_name 
+    SELECT id, name, original_birth_date, mother_name 
     FROM "People" 
     WHERE city_id = 4
     LIMIT ${limit} OFFSET ${offset};
@@ -69,6 +69,54 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
 
   console.log(`Pessoas filtradas entre 16 e 30 anos: ${JSON.stringify(filteredPeople, null, 2)}`);
   return filteredPeople;
+}
+
+async function updatePersonVoterData(personId, voterData) {
+  const client = new Client({
+    user: process.env.DB_USER,
+    host: process.env.DB_HOST,
+    database: process.env.DB_NAME,
+    password: process.env.DB_PASSWORD,
+    port: process.env.DB_PORT,
+    ssl: {
+      rejectUnauthorized: false,
+    },
+  });
+
+  await client.connect();
+  console.log(`Atualizando dados de votação para a pessoa ID: ${personId}`);
+
+  const query = `
+    UPDATE "People"
+    SET titulo_eleitor = $1,
+        zona_eleitoral = $2,
+        secao_eleitoral = $3,
+        local_votacao = $4,
+        endereco_votacao = $5,
+        municipio_votacao = $6,
+        biometria = $7
+    WHERE id = $8
+  `;
+
+  const values = [
+    voterData.inscricao,
+    voterData.zona,
+    voterData.secao,
+    voterData.local,
+    voterData.endereco,
+    voterData.municipio,
+    voterData.biometria,
+    personId
+  ];
+
+  try {
+    await client.query(query, values);
+    console.log(`Dados de votação atualizados com sucesso para a pessoa ID: ${personId}`);
+  } catch (error) {
+    console.error(`Erro ao atualizar os dados de votação para a pessoa ID ${personId}:`, error);
+  } finally {
+    await client.end();
+  }
 }
 
 async function fetchVoterDataWithCache(redisClient, name, birthDate, motherName) {
@@ -112,8 +160,9 @@ async function createPuppeteerCluster() {
     monitor: true,
   });
 
-  // Tarefa do cluster
-  await cluster.task(async ({ page, data: { redisClient, name, birthDate, motherName, counts } }) => {
+  await cluster.task(async ({ page, data: { redisClient, person, counts } }) => {
+    const { id, name, original_birth_date: birthDate, mother_name: motherName } = person;
+
     try {
       if (!redisClient || !redisClient.connected) {
         console.error('Redis client já foi fechado ou não está conectado!');
@@ -125,6 +174,7 @@ async function createPuppeteerCluster() {
       if (cachedData) {
         console.log(`Dados de cache usados para ${name}`);
         counts.success++;
+        await updatePersonVoterData(id, cachedData);  
         return cachedData;
       }
 
@@ -223,6 +273,7 @@ async function createPuppeteerCluster() {
       await redisClient.set(`voter_data_${name}_${birthDate}_${motherName}`, JSON.stringify(data), 'EX', 3600);
       counts.success++;
 
+      await updatePersonVoterData(id, data); 
       return data;
     } catch (error) {
       console.error(`Erro ao processar ${name}: ${error.message}`);
@@ -298,8 +349,7 @@ async function createPuppeteerCluster() {
 
       try {
         for (const person of people) {
-          const { name, original_birth_date: birthDate, mother_name: motherName } = person;
-          puppeteerCluster.queue({ redisClient, name, birthDate, motherName, counts });
+          puppeteerCluster.queue({ redisClient, person, counts });
         }
 
         await puppeteerCluster.idle();
