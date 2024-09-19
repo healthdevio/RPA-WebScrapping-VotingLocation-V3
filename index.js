@@ -1,19 +1,25 @@
-// Importando as dependências necessárias
 const { Cluster } = require('puppeteer-cluster');
 const os = require('os');
 const cluster = require('cluster');
 const path = require('path');
 require('dotenv').config();
 const fs = require('fs');
-const { Client } = require('pg'); // PostgreSQL client
+const { Client } = require('pg'); 
+const redis = require('redis'); 
+const util = require('util'); 
 
-// Formatação da data no formato DD/MM/YYYY
+const redisClient = redis.createClient();
+redisClient.on('error', (err) => {
+  console.error('Erro ao conectar ao Redis:', err);
+});
+redisClient.get = util.promisify(redisClient.get);
+redisClient.set = util.promisify(redisClient.set);
+
 function formatDate(dateStr) {
   const [day, month, year] = dateStr.split('/');
   return `${day}/${month}/${year}`;
 }
 
-// Cálculo da idade com base na data de nascimento
 function calculateAge(birthDate) {
   const [day, month, year] = birthDate.split('/');
   const birth = new Date(`${year}-${month}-${day}`);
@@ -22,7 +28,6 @@ function calculateAge(birthDate) {
   return Math.abs(ageDate.getUTCFullYear() - 1970);
 }
 
-// Função para conectar ao banco de dados e buscar os registros filtrados
 async function getPeopleFromDatabase() {
   const client = new Client({
     user: process.env.DB_USER,
@@ -40,11 +45,9 @@ async function getPeopleFromDatabase() {
     WHERE city_id = 4;
   `;
 
-  // Buscando os dados do banco de dados e finalizando a conexão
   const res = await client.query(query);
   await client.end();
 
-  // Filtrar os registros com idade entre 16 e 26 anos
   const filteredPeople = res.rows.filter((person) => {
     const age = calculateAge(person.original_birth_date);
     return age >= 16 && age <= 26;
@@ -53,11 +56,31 @@ async function getPeopleFromDatabase() {
   return filteredPeople;
 }
 
-// Função para criar e gerenciar o puppeteer-cluster
+async function fetchVoterDataWithCache(name, birthDate, motherName) {
+  const cacheKey = `voter_data_${name}_${birthDate}_${motherName}`;
+
+  try {
+    const cachedData = await redisClient.get(cacheKey);
+    if (cachedData) {
+      console.log(`Dados de cache encontrados para ${name}`);
+      return JSON.parse(cachedData); 
+    }
+
+    const data = await fetchVoterData(name, birthDate, motherName);
+
+    await redisClient.set(cacheKey, JSON.stringify(data), 'EX', 3600);
+
+    return data;
+  } catch (error) {
+    console.error(`Erro ao buscar ou salvar dados no cache para ${name}:`, error);
+    throw error;
+  }
+}
+
 async function createPuppeteerCluster() {
   const cluster = await Cluster.launch({
-    concurrency: Cluster.CONCURRENCY_BROWSER, // Usa múltiplos navegadores
-    maxConcurrency: 5, // Define o limite de navegadores simultâneos por worker
+    concurrency: Cluster.CONCURRENCY_BROWSER, 
+    maxConcurrency: 5, 
     puppeteerOptions: {
       args: [
         '--no-sandbox',
@@ -72,7 +95,6 @@ async function createPuppeteerCluster() {
     },
   });
 
-  // Definindo a tarefa de scraping no cluster
   await cluster.task(async ({ page, data: { name, birthDate, motherName } }) => {
     try {
       console.log(`Processando ${name}...`);
@@ -115,7 +137,6 @@ async function createPuppeteerCluster() {
         return { error: 'Pessoa não encontrada' };
       }
 
-      // Extraindo os dados de zona, seção, local de votação e outros dados
       const data = await page.evaluate(() => {
         const extractZonaSecao = () => {
           const element = Array.from(document.querySelectorAll('p')).find(
@@ -167,37 +188,33 @@ async function createPuppeteerCluster() {
   return cluster;
 }
 
-// Função principal que coordena o fluxo de execução com cluster e puppeteer-cluster
 (async function () {
   if (cluster.isMaster) {
-    const numCPUs = os.cpus().length; // Obtendo o número de núcleos de CPU disponíveis
-    const people = await getPeopleFromDatabase(); // Obtendo a lista de pessoas
+    const numCPUs = os.cpus().length; 
+    const people = await getPeopleFromDatabase(); 
 
     console.log(`Iniciando processamento com ${numCPUs} núcleos de CPU.`);
 
-    // Dividindo o trabalho entre os workers (cada worker processa uma parte da lista de pessoas)
     for (let i = 0; i < numCPUs; i++) {
       const worker = cluster.fork();
       worker.send(people.slice(i * Math.ceil(people.length / numCPUs), (i + 1) * Math.ceil(people.length / numCPUs)));
     }
 
-    // Capturando mensagens dos workers
     cluster.on('message', (worker, message) => {
       console.log(`Worker ${worker.id} finalizou o processamento:`, message);
     });
 
   } else {
-    // Cada worker cria seu próprio puppeteer-cluster e processa a parte da lista recebida
     process.on('message', async (people) => {
-      const puppeteerCluster = await createPuppeteerCluster(); // Criando um puppeteer-cluster por worker
+      const puppeteerCluster = await createPuppeteerCluster(); 
 
       for (const person of people) {
         const { name, original_birth_date: birthDate, mother_name: motherName } = person;
         puppeteerCluster.queue({ name, birthDate, motherName });
       }
 
-      await puppeteerCluster.idle(); // Espera até que todas as tarefas sejam processadas
-      await puppeteerCluster.close(); // Fecha o cluster Puppeteer
+      await puppeteerCluster.idle(); 
+      await puppeteerCluster.close(); 
     });
   }
 })();
