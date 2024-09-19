@@ -67,11 +67,7 @@ async function fetchVoterDataWithCache(name, birthDate, motherName) {
       return JSON.parse(cachedData);
     }
 
-    const data = await fetchVoterData(name, birthDate, motherName);
-
-    await redisClient.set(cacheKey, JSON.stringify(data), 'EX', 3600);
-
-    return data;
+    return null;
   } catch (error) {
     console.error(`Erro ao buscar ou salvar dados no cache para ${name}:`, error);
     throw error;
@@ -99,6 +95,14 @@ async function createPuppeteerCluster() {
 
   await cluster.task(async ({ page, data: { name, birthDate, motherName } }) => {
     try {
+      const cachedData = await fetchVoterDataWithCache(name, birthDate, motherName);
+
+      if (cachedData) {
+        // Retorna os dados diretamente do cache se estiverem disponíveis
+        console.log(`Dados de cache usados para ${name}`);
+        return cachedData;
+      }
+
       console.log(`Processando ${name}...`);
 
       await page.goto('https://www.tre-ce.jus.br/servicos-eleitorais/titulo-e-local-de-votacao/consulta-por-nome', {
@@ -179,6 +183,8 @@ async function createPuppeteerCluster() {
           biometria: document.body.innerText.includes('ELEITOR/ELEITORA COM BIOMETRIA COLETADA'),
         };
       });
+
+      await redisClient.set(`voter_data_${name}_${birthDate}_${motherName}`, JSON.stringify(data), 'EX', 3600);
 
       return data;
     } catch (error) {
