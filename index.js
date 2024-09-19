@@ -88,7 +88,7 @@ async function fetchVoterDataWithCache(name, birthDate, motherName) {
 async function createPuppeteerCluster() {
   const cluster = await Cluster.launch({
     concurrency: Cluster.CONCURRENCY_BROWSER,
-    maxConcurrency: 5, 
+    maxConcurrency: 2, 
     puppeteerOptions: {
       args: [
         '--no-sandbox',
@@ -100,7 +100,7 @@ async function createPuppeteerCluster() {
         '--disable-gpu',
       ],
       headless: true,
-      userDataDir: `/tmp/puppeteer_user_data_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, 
+      // userDataDir: `/tmp/puppeteer_user_data_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, 
     },
   });
 
