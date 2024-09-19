@@ -42,6 +42,8 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
 
   await client.connect();
 
+  console.log(`Executando consulta SQL com offset ${offset} e limite ${limit}`);
+
   const query = `
     SELECT name, original_birth_date, mother_name 
     FROM "People" 
@@ -50,12 +52,18 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   `;
 
   const res = await client.query(query);
+  
+  console.log(`Dados retornados do banco de dados: ${JSON.stringify(res.rows, null, 2)}`);
+
   await client.end();
 
   const filteredPeople = res.rows.filter((person) => {
     const age = calculateAge(person.original_birth_date);
-    return age >= 16 && age <= 26;
+    console.log(`Calculando idade para ${person.name}: ${age} anos`);
+    return age >= 16 && age <= 30;
   });
+
+  console.log(`Pessoas filtradas entre 16 e 30 anos: ${JSON.stringify(filteredPeople, null, 2)}`);
 
   return filteredPeople;
 }
@@ -101,7 +109,6 @@ async function createPuppeteerCluster() {
       const cachedData = await fetchVoterDataWithCache(name, birthDate, motherName);
 
       if (cachedData) {
-        // Retorna os dados diretamente do cache se estiverem disponíveis
         console.log(`Dados de cache usados para ${name}`);
         return cachedData;
       }
@@ -205,13 +212,21 @@ async function createPuppeteerCluster() {
     const batchSize = 1000; 
     let offset = 0;
     let totalProcessed = 0;
+    let noResultsCounter = 0; 
 
-    while (true) {
+    while (noResultsCounter < 3) {  
+      console.log(`Buscando pessoas no banco de dados com offset ${offset} e batchSize ${batchSize}`);
       const people = await getPeopleFromDatabase(offset, batchSize); 
 
-      if (people.length === 0) break; 
+      if (people.length === 0) {
+        console.log('Nenhuma pessoa foi encontrada no banco de dados.');
+        noResultsCounter++;
+        offset += batchSize;
+        continue; 
+      }
 
       console.log(`Iniciando processamento do batch com ${people.length} pessoas.`);
+      noResultsCounter = 0; 
 
       for (let i = 0; i < numCPUs; i++) {
         const worker = cluster.fork();
