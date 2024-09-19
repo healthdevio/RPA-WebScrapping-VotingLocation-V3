@@ -35,7 +35,6 @@ function calculateAge(birthDate) {
   return Math.abs(ageDate.getUTCFullYear() - 1970);
 }
 
-// Função para buscar pessoas no banco de dados
 async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   const client = new Client({
     user: process.env.DB_USER,
