@@ -35,6 +35,9 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
     database: process.env.DB_NAME,
     password: process.env.DB_PASSWORD,
     port: process.env.DB_PORT,
+    ssl: {
+      rejectUnauthorized: false, // Ignora a verificação do certificado autoassinado
+    },  
   });
 
   await client.connect();
