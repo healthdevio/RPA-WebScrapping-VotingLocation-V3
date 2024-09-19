@@ -90,8 +90,9 @@ async function fetchVoterDataWithCache(redisClient, name, birthDate, motherName)
 async function createPuppeteerCluster() {
   const cluster = await Cluster.launch({
     concurrency: Cluster.CONCURRENCY_BROWSER,
-    maxConcurrency: 3,
+    maxConcurrency: 2,
     puppeteerOptions: {
+      headless: true,
       args: [
         '--no-sandbox',
         '--disable-setuid-sandbox',
@@ -100,17 +101,19 @@ async function createPuppeteerCluster() {
         '--no-first-run',
         '--no-zygote',
         '--disable-gpu',
+        '--disable-extensions',
       ],
-      headless: true,
     },
+    monitor: true,   
   });
 
-  await cluster.task(async ({ page, data: { redisClient, name, birthDate, motherName } }) => {
+  await cluster.task(async ({ page, data: { redisClient, name, birthDate, motherName, counts } }) => {
     try {
       const cachedData = await fetchVoterDataWithCache(redisClient, name, birthDate, motherName);
 
       if (cachedData) {
         console.log(`Dados de cache usados para ${name}`);
+        counts.success++; 
         return cachedData;
       }
 
@@ -151,6 +154,7 @@ async function createPuppeteerCluster() {
 
       if ((await page.$('div.alert.alert-warning')) !== null) {
         console.log(`Pessoa não encontrada no sistema do TRE: ${name}`);
+        counts.failure++; 
         return { error: 'Pessoa não encontrada' };
       }
 
@@ -196,10 +200,12 @@ async function createPuppeteerCluster() {
       });
 
       await redisClient.set(`voter_data_${name}_${birthDate}_${motherName}`, JSON.stringify(data), 'EX', 3600);
+      counts.success++;
 
       return data;
     } catch (error) {
       console.error(`Erro ao processar ${name}: ${error.message}`);
+      counts.failure++;
       return { error: error.message };
     }
   });
@@ -213,6 +219,8 @@ async function createPuppeteerCluster() {
     const batchSize = 1000;
     let offset = 0;
     let totalProcessed = 0;
+    let totalSuccess = 0;
+    let totalFailure = 0;
     let noResultsCounter = 0;
 
     while (noResultsCounter < 3) {
@@ -231,28 +239,34 @@ async function createPuppeteerCluster() {
 
       for (let i = 0; i < numCPUs; i++) {
         const worker = cluster.fork();
-        worker.send(people.slice(i * Math.ceil(people.length / numCPUs), (i + 1) * Math.ceil(people.length / numCPUs)));
+        worker.send({
+          people: people.slice(i * Math.ceil(people.length / numCPUs), (i + 1) * Math.ceil(people.length / numCPUs)),
+          counts: { success: 0, failure: 0 } 
+        });
       }
 
-      cluster.on('message', (worker, message) => {
-        console.log(`Worker ${worker.id} finalizou o processamento:`, message);
+      cluster.on('message', (worker, { success, failure }) => {
+        totalSuccess += success;
+        totalFailure += failure;
+        totalProcessed += success + failure;
+        console.log(`Worker ${worker.id} finalizou o processamento: ${success} com sucesso, ${failure} falharam.`);
       });
 
-      totalProcessed += people.length;
       offset += batchSize;
     }
 
     console.log(`Processamento completo. Total de registros processados: ${totalProcessed}`);
+    console.log(`Total com sucesso: ${totalSuccess}, total com falha: ${totalFailure}`);
   } else {
     const redisClient = createRedisClient();
 
-    process.on('message', async (people) => {
+    process.on('message', async ({ people, counts }) => {
       const puppeteerCluster = await createPuppeteerCluster();
 
       try {
         for (const person of people) {
           const { name, original_birth_date: birthDate, mother_name: motherName } = person;
-          puppeteerCluster.queue({ redisClient, name, birthDate, motherName });
+          puppeteerCluster.queue({ redisClient, name, birthDate, motherName, counts });
         }
 
         await puppeteerCluster.idle(); 
@@ -261,6 +275,7 @@ async function createPuppeteerCluster() {
       } finally {
         await puppeteerCluster.close();
         redisClient.quit();
+        process.send({ success: counts.success, failure: counts.failure });
         process.exit(); 
       }
     });
