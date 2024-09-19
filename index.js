@@ -8,16 +8,16 @@ const util = require('util');
 
 function createRedisClient() {
   const redisClient = redis.createClient({
-    host: process.env.REDIS_HOST || 'localhost', 
-    port: process.env.REDIS_PORT || 6379         
+    host: process.env.REDIS_HOST || 'localhost',
+    port: process.env.REDIS_PORT || 6379
   });
 
   redisClient.on('error', (err) => {
     console.error('Erro ao conectar ao Redis:', err);
   });
 
-  redisClient.get = util.promisify(redisClient.get);  
-  redisClient.set = util.promisify(redisClient.set); 
+  redisClient.get = util.promisify(redisClient.get);
+  redisClient.set = util.promisify(redisClient.set);
 
   return redisClient;
 }
@@ -35,6 +35,7 @@ function calculateAge(birthDate) {
   return Math.abs(ageDate.getUTCFullYear() - 1970);
 }
 
+// Função para buscar pessoas no banco de dados
 async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   const client = new Client({
     user: process.env.DB_USER,
@@ -74,6 +75,11 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
 async function fetchVoterDataWithCache(redisClient, name, birthDate, motherName) {
   const cacheKey = `voter_data_${name}_${birthDate}_${motherName}`;
 
+  if (!redisClient || !redisClient.connected) {
+    console.error('Tentativa de usar cliente Redis que já está fechado!');
+    throw new Error('Redis client is closed or unavailable');
+  }
+
   try {
     const cachedData = await redisClient.get(cacheKey);
     if (cachedData) {
@@ -104,16 +110,22 @@ async function createPuppeteerCluster() {
         '--disable-extensions',
       ],
     },
-    monitor: true,   
+    monitor: true,
   });
 
+  // Tarefa do cluster
   await cluster.task(async ({ page, data: { redisClient, name, birthDate, motherName, counts } }) => {
     try {
+      if (!redisClient || !redisClient.connected) {
+        console.error('Redis client já foi fechado ou não está conectado!');
+        throw new Error('Redis client not available');
+      }
+
       const cachedData = await fetchVoterDataWithCache(redisClient, name, birthDate, motherName);
 
       if (cachedData) {
         console.log(`Dados de cache usados para ${name}`);
-        counts.success++; 
+        counts.success++;
         return cachedData;
       }
 
@@ -148,13 +160,17 @@ async function createPuppeteerCluster() {
       if (submitButton) {
         await page.evaluate((button) => button.click(), submitButton);
         console.log(`Submetendo formulário para ${name}`);
+      } else {
+        console.error(`Botão de submissão não encontrado para ${name}`);
+        counts.failure++;
+        return { error: 'Erro ao submeter formulário' };
       }
 
       await page.waitForFunction(() => !document.body.innerText.includes('carregando conteúdo'), { timeout: 90000 });
 
       if ((await page.$('div.alert.alert-warning')) !== null) {
         console.log(`Pessoa não encontrada no sistema do TRE: ${name}`);
-        counts.failure++; 
+        counts.failure++;
         return { error: 'Pessoa não encontrada' };
       }
 
@@ -199,6 +215,12 @@ async function createPuppeteerCluster() {
         };
       });
 
+      if (!data.inscricao) {
+        console.error(`Erro: Não foi possível extrair a inscrição para ${name}`);
+        counts.failure++;
+        return { error: 'Erro ao extrair inscrição' };
+      }
+
       await redisClient.set(`voter_data_${name}_${birthDate}_${motherName}`, JSON.stringify(data), 'EX', 3600);
       counts.success++;
 
@@ -237,20 +259,32 @@ async function createPuppeteerCluster() {
       console.log(`Iniciando processamento do batch com ${people.length} pessoas.`);
       noResultsCounter = 0;
 
+      const workers = [];
       for (let i = 0; i < numCPUs; i++) {
         const worker = cluster.fork();
+        workers.push(worker);
+
         worker.send({
           people: people.slice(i * Math.ceil(people.length / numCPUs), (i + 1) * Math.ceil(people.length / numCPUs)),
-          counts: { success: 0, failure: 0 } 
+          counts: { success: 0, failure: 0 }
+        });
+
+        worker.on('message', ({ success, failure }) => {
+          totalSuccess += success;
+          totalFailure += failure;
+          totalProcessed += success + failure;
+          console.log(`Worker ${worker.id} finalizou o processamento: ${success} com sucesso, ${failure} falharam.`);
+        });
+
+        worker.on('exit', (code, signal) => {
+          console.log(`Worker ${worker.process.pid} foi encerrado. Código: ${code}, Sinal: ${signal}`);
         });
       }
 
-      cluster.on('message', (worker, { success, failure }) => {
-        totalSuccess += success;
-        totalFailure += failure;
-        totalProcessed += success + failure;
-        console.log(`Worker ${worker.id} finalizou o processamento: ${success} com sucesso, ${failure} falharam.`);
-      });
+      for (const worker of workers) {
+        await new Promise((resolve) => worker.on('exit', resolve));
+        worker.kill();
+      }
 
       offset += batchSize;
     }
@@ -269,12 +303,14 @@ async function createPuppeteerCluster() {
           puppeteerCluster.queue({ redisClient, name, birthDate, motherName, counts });
         }
 
-        await puppeteerCluster.idle(); 
+        await puppeteerCluster.idle();
       } catch (error) {
         console.error('Erro durante o processamento:', error);
       } finally {
         await puppeteerCluster.close();
-        redisClient.quit();
+        if (redisClient && redisClient.connected) {
+          redisClient.quit();
+        }
         process.send({ success: counts.success, failure: counts.failure });
         process.exit(); 
       }
