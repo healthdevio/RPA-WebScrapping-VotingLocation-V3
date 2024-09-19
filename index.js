@@ -41,7 +41,7 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
 
   const query = `
     SELECT name, original_birth_date, mother_name 
-    FROM People 
+    FROM "People" 
     WHERE city_id = 4
     LIMIT ${limit} OFFSET ${offset};
   `;
