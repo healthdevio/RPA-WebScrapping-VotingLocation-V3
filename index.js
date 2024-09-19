@@ -8,16 +8,16 @@ const util = require('util');
 
 function createRedisClient() {
   const redisClient = redis.createClient({
-    host: process.env.REDIS_HOST, 
-    port: process.env.REDIS_PORT    
+    host: process.env.REDIS_HOST || 'localhost', 
+    port: process.env.REDIS_PORT || 6379         
   });
 
   redisClient.on('error', (err) => {
     console.error('Erro ao conectar ao Redis:', err);
   });
 
-  redisClient.get = util.promisify(redisClient.get);
-  redisClient.set = util.promisify(redisClient.set);
+  redisClient.get = util.promisify(redisClient.get);  
+  redisClient.set = util.promisify(redisClient.set); 
 
   return redisClient;
 }
@@ -87,10 +87,10 @@ async function fetchVoterDataWithCache(redisClient, name, birthDate, motherName)
   }
 }
 
-async function createPuppeteerCluster(redisClient) {
+async function createPuppeteerCluster() {
   const cluster = await Cluster.launch({
     concurrency: Cluster.CONCURRENCY_BROWSER,
-    maxConcurrency: 2,
+    maxConcurrency: 3,
     puppeteerOptions: {
       args: [
         '--no-sandbox',
@@ -105,7 +105,7 @@ async function createPuppeteerCluster(redisClient) {
     },
   });
 
-  await cluster.task(async ({ page, data: { name, birthDate, motherName } }) => {
+  await cluster.task(async ({ page, data: { redisClient, name, birthDate, motherName } }) => {
     try {
       const cachedData = await fetchVoterDataWithCache(redisClient, name, birthDate, motherName);
 
@@ -247,20 +247,20 @@ async function createPuppeteerCluster(redisClient) {
     const redisClient = createRedisClient();
 
     process.on('message', async (people) => {
-      const puppeteerCluster = await createPuppeteerCluster(redisClient);
+      const puppeteerCluster = await createPuppeteerCluster();
 
       try {
         for (const person of people) {
           const { name, original_birth_date: birthDate, mother_name: motherName } = person;
-          puppeteerCluster.queue({ name, birthDate, motherName });
+          puppeteerCluster.queue({ redisClient, name, birthDate, motherName });
         }
 
         await puppeteerCluster.idle(); 
       } catch (error) {
         console.error('Erro durante o processamento:', error);
       } finally {
-        await puppeteerCluster.close(); 
-        await redisClient.quit(); 
+        await puppeteerCluster.close();
+        redisClient.quit();
         process.exit(); 
       }
     });
