@@ -100,7 +100,7 @@ async function createPuppeteerCluster() {
         '--disable-gpu',
       ],
       headless: true,
-      userDataDir: './user_data', 
+      userDataDir: `/tmp/puppeteer_user_data_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, 
     },
   });
 
