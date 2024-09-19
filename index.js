@@ -1,19 +1,26 @@
 const { Cluster } = require('puppeteer-cluster');
 const os = require('os');
 const cluster = require('cluster');
-const path = require('path');
 require('dotenv').config();
-const fs = require('fs');
 const { Client } = require('pg');
 const redis = require('redis');
 const util = require('util');
 
-const redisClient = redis.createClient();
-redisClient.on('error', (err) => {
-  console.error('Erro ao conectar ao Redis:', err);
-});
-redisClient.get = util.promisify(redisClient.get);
-redisClient.set = util.promisify(redisClient.set);
+function createRedisClient() {
+  const redisClient = redis.createClient({
+    host: process.env.REDIS_HOST, 
+    port: process.env.REDIS_PORT    
+  });
+
+  redisClient.on('error', (err) => {
+    console.error('Erro ao conectar ao Redis:', err);
+  });
+
+  redisClient.get = util.promisify(redisClient.get);
+  redisClient.set = util.promisify(redisClient.set);
+
+  return redisClient;
+}
 
 function formatDate(dateStr) {
   const [day, month, year] = dateStr.split('/');
@@ -36,12 +43,11 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
     password: process.env.DB_PASSWORD,
     port: process.env.DB_PORT,
     ssl: {
-      rejectUnauthorized: false, 
-    },  
+      rejectUnauthorized: false,
+    },
   });
 
   await client.connect();
-
   console.log(`Executando consulta SQL com offset ${offset} e limite ${limit}`);
 
   const query = `
@@ -52,9 +58,7 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   `;
 
   const res = await client.query(query);
-  
   console.log(`Dados retornados do banco de dados: ${JSON.stringify(res.rows, null, 2)}`);
-
   await client.end();
 
   const filteredPeople = res.rows.filter((person) => {
@@ -64,11 +68,10 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   });
 
   console.log(`Pessoas filtradas entre 16 e 30 anos: ${JSON.stringify(filteredPeople, null, 2)}`);
-
   return filteredPeople;
 }
 
-async function fetchVoterDataWithCache(name, birthDate, motherName) {
+async function fetchVoterDataWithCache(redisClient, name, birthDate, motherName) {
   const cacheKey = `voter_data_${name}_${birthDate}_${motherName}`;
 
   try {
@@ -77,7 +80,6 @@ async function fetchVoterDataWithCache(name, birthDate, motherName) {
       console.log(`Dados de cache encontrados para ${name}`);
       return JSON.parse(cachedData);
     }
-
     return null;
   } catch (error) {
     console.error(`Erro ao buscar ou salvar dados no cache para ${name}:`, error);
@@ -85,10 +87,10 @@ async function fetchVoterDataWithCache(name, birthDate, motherName) {
   }
 }
 
-async function createPuppeteerCluster() {
+async function createPuppeteerCluster(redisClient) {
   const cluster = await Cluster.launch({
     concurrency: Cluster.CONCURRENCY_BROWSER,
-    maxConcurrency: 2, 
+    maxConcurrency: 2,
     puppeteerOptions: {
       args: [
         '--no-sandbox',
@@ -100,13 +102,12 @@ async function createPuppeteerCluster() {
         '--disable-gpu',
       ],
       headless: true,
-      // userDataDir: `/tmp/puppeteer_user_data_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`, 
     },
   });
 
   await cluster.task(async ({ page, data: { name, birthDate, motherName } }) => {
     try {
-      const cachedData = await fetchVoterDataWithCache(name, birthDate, motherName);
+      const cachedData = await fetchVoterDataWithCache(redisClient, name, birthDate, motherName);
 
       if (cachedData) {
         console.log(`Dados de cache usados para ${name}`);
@@ -209,24 +210,24 @@ async function createPuppeteerCluster() {
 (async function () {
   if (cluster.isMaster) {
     const numCPUs = os.cpus().length;
-    const batchSize = 1000; 
+    const batchSize = 1000;
     let offset = 0;
     let totalProcessed = 0;
-    let noResultsCounter = 0; 
+    let noResultsCounter = 0;
 
-    while (noResultsCounter < 3) {  
+    while (noResultsCounter < 3) {
       console.log(`Buscando pessoas no banco de dados com offset ${offset} e batchSize ${batchSize}`);
-      const people = await getPeopleFromDatabase(offset, batchSize); 
+      const people = await getPeopleFromDatabase(offset, batchSize);
 
       if (people.length === 0) {
         console.log('Nenhuma pessoa foi encontrada no banco de dados.');
         noResultsCounter++;
         offset += batchSize;
-        continue; 
+        continue;
       }
 
       console.log(`Iniciando processamento do batch com ${people.length} pessoas.`);
-      noResultsCounter = 0; 
+      noResultsCounter = 0;
 
       for (let i = 0; i < numCPUs; i++) {
         const worker = cluster.fork();
@@ -238,21 +239,30 @@ async function createPuppeteerCluster() {
       });
 
       totalProcessed += people.length;
-      offset += batchSize; 
+      offset += batchSize;
     }
 
     console.log(`Processamento completo. Total de registros processados: ${totalProcessed}`);
   } else {
+    const redisClient = createRedisClient();
+
     process.on('message', async (people) => {
-      const puppeteerCluster = await createPuppeteerCluster(); 
+      const puppeteerCluster = await createPuppeteerCluster(redisClient);
 
-      for (const person of people) {
-        const { name, original_birth_date: birthDate, mother_name: motherName } = person;
-        puppeteerCluster.queue({ name, birthDate, motherName });
+      try {
+        for (const person of people) {
+          const { name, original_birth_date: birthDate, mother_name: motherName } = person;
+          puppeteerCluster.queue({ name, birthDate, motherName });
+        }
+
+        await puppeteerCluster.idle(); 
+      } catch (error) {
+        console.error('Erro durante o processamento:', error);
+      } finally {
+        await puppeteerCluster.close(); 
+        await redisClient.quit(); 
+        process.exit(); 
       }
-
-      await puppeteerCluster.idle();
-      await puppeteerCluster.close();
     });
   }
 })();
