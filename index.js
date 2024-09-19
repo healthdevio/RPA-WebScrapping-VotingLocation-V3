@@ -4,9 +4,9 @@ const cluster = require('cluster');
 const path = require('path');
 require('dotenv').config();
 const fs = require('fs');
-const { Client } = require('pg'); 
-const redis = require('redis'); 
-const util = require('util'); 
+const { Client } = require('pg');
+const redis = require('redis');
+const util = require('util');
 
 const redisClient = redis.createClient();
 redisClient.on('error', (err) => {
@@ -28,7 +28,7 @@ function calculateAge(birthDate) {
   return Math.abs(ageDate.getUTCFullYear() - 1970);
 }
 
-async function getPeopleFromDatabase() {
+async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   const client = new Client({
     user: process.env.DB_USER,
     host: process.env.DB_HOST,
@@ -42,7 +42,8 @@ async function getPeopleFromDatabase() {
   const query = `
     SELECT name, original_birth_date, mother_name 
     FROM People 
-    WHERE city_id = 4;
+    WHERE city_id = 4
+    LIMIT ${limit} OFFSET ${offset};
   `;
 
   const res = await client.query(query);
@@ -63,7 +64,7 @@ async function fetchVoterDataWithCache(name, birthDate, motherName) {
     const cachedData = await redisClient.get(cacheKey);
     if (cachedData) {
       console.log(`Dados de cache encontrados para ${name}`);
-      return JSON.parse(cachedData); 
+      return JSON.parse(cachedData);
     }
 
     const data = await fetchVoterData(name, birthDate, motherName);
@@ -79,7 +80,7 @@ async function fetchVoterDataWithCache(name, birthDate, motherName) {
 
 async function createPuppeteerCluster() {
   const cluster = await Cluster.launch({
-    concurrency: Cluster.CONCURRENCY_BROWSER, 
+    concurrency: Cluster.CONCURRENCY_BROWSER,
     maxConcurrency: 5, 
     puppeteerOptions: {
       args: [
@@ -91,7 +92,8 @@ async function createPuppeteerCluster() {
         '--no-zygote',
         '--disable-gpu',
       ],
-      headless: true, // Executa no modo headless
+      headless: true,
+      userDataDir: './user_data', 
     },
   });
 
@@ -190,20 +192,32 @@ async function createPuppeteerCluster() {
 
 (async function () {
   if (cluster.isMaster) {
-    const numCPUs = os.cpus().length; 
-    const people = await getPeopleFromDatabase(); 
+    const numCPUs = os.cpus().length;
+    const batchSize = 1000; 
+    let offset = 0;
+    let totalProcessed = 0;
 
-    console.log(`Iniciando processamento com ${numCPUs} núcleos de CPU.`);
+    while (true) {
+      const people = await getPeopleFromDatabase(offset, batchSize); 
 
-    for (let i = 0; i < numCPUs; i++) {
-      const worker = cluster.fork();
-      worker.send(people.slice(i * Math.ceil(people.length / numCPUs), (i + 1) * Math.ceil(people.length / numCPUs)));
+      if (people.length === 0) break; 
+
+      console.log(`Iniciando processamento do batch com ${people.length} pessoas.`);
+
+      for (let i = 0; i < numCPUs; i++) {
+        const worker = cluster.fork();
+        worker.send(people.slice(i * Math.ceil(people.length / numCPUs), (i + 1) * Math.ceil(people.length / numCPUs)));
+      }
+
+      cluster.on('message', (worker, message) => {
+        console.log(`Worker ${worker.id} finalizou o processamento:`, message);
+      });
+
+      totalProcessed += people.length;
+      offset += batchSize; 
     }
 
-    cluster.on('message', (worker, message) => {
-      console.log(`Worker ${worker.id} finalizou o processamento:`, message);
-    });
-
+    console.log(`Processamento completo. Total de registros processados: ${totalProcessed}`);
   } else {
     process.on('message', async (people) => {
       const puppeteerCluster = await createPuppeteerCluster(); 
@@ -213,8 +227,8 @@ async function createPuppeteerCluster() {
         puppeteerCluster.queue({ name, birthDate, motherName });
       }
 
-      await puppeteerCluster.idle(); 
-      await puppeteerCluster.close(); 
+      await puppeteerCluster.idle();
+      await puppeteerCluster.close();
     });
   }
 })();
