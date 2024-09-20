@@ -133,6 +133,7 @@ async function createPuppeteerCluster() {
 
       await page.goto('https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/atendimento-eleitor/onde-votar', {
         waitUntil: 'networkidle2',
+        timeout: 120000,
       });
 
       await page.waitForSelector('.cookies .botao button', { visible: true, timeout: 5000 });
@@ -148,7 +149,6 @@ async function createPuppeteerCluster() {
       const normalizedName = normalize(name.toUpperCase());
       const normalizedMotherName = normalize(motherName.toUpperCase());
 
-      // Preenchimento dos campos com normalize correto
       await page.type('input[placeholder="Número do título eleitoral ou CPF ou nome"]', normalizedName);
       console.log(`Nome preenchido: ${normalizedName}`);
 
@@ -174,9 +174,10 @@ async function createPuppeteerCluster() {
         return { error: 'Pessoa não encontrada' };
       }
 
-      // Extração de dados adaptada conforme o segundo código
+      // Adiciona espera para garantir que o conteúdo foi carregado
+      await page.waitForTimeout(3000); 
+
       const data = await page.evaluate(() => {
-        // Verifica se o componente de dados do eleitor está presente
         const voterComponent = document.querySelector('.componente-onde-votar');
         if (!voterComponent) {
           return {
@@ -185,16 +186,14 @@ async function createPuppeteerCluster() {
           };
         }
 
-        // Extrai os rótulos e descrições
         const labels = Array.from(
           document.querySelectorAll('.lado-ov .data-box .label'),
-        ).map((el) => el.textContent.trim());
+        ).map((el) => el.textContent.trim() ?? null);
 
         const descs = Array.from(
           document.querySelectorAll('.lado-ov .data-box .desc'),
-        ).map((el) => el.textContent.trim());
+        ).map((el) => el.textContent.trim() ?? null);
 
-        // Mapeia os rótulos para os campos correspondentes
         const result = {};
         const possibleLabels = {
           'Local de votação': 'local',
@@ -212,7 +211,6 @@ async function createPuppeteerCluster() {
           }
         });
 
-        // Verifica se a biometria foi coletada
         result.biometria = document.body.innerText.includes(
           'ELEITOR/ELEITORA COM BIOMETRIA COLETADA'
         );
@@ -220,7 +218,6 @@ async function createPuppeteerCluster() {
         return { error: false, data: result };
       });
 
-      // Verificação e tratamento do resultado
       if (data.error) {
         const screenshotPath = path.join(
           __dirname,
@@ -237,7 +234,7 @@ async function createPuppeteerCluster() {
       return data.data;
     } catch (error) {
       console.error(`Erro ao processar ${name}: ${error.message}`);
-      console.log('Dados do caba mae, nome, data:', motherName, name, birthDate); // Log detalhado ao ocorrer erro
+      console.log('Dados do caba mae, nome, data:', motherName, name, birthDate); 
       await page.screenshot({ path: `error_${name}.png`, fullPage: true }); 
       counts.failure++;
       return { error: error.message };
