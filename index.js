@@ -3,24 +3,6 @@ const os = require('os');
 const cluster = require('cluster');
 require('dotenv').config();
 const { Client } = require('pg');
-const redis = require('redis');
-const util = require('util');
-
-function createRedisClient() {
-  const redisClient = redis.createClient({
-    host: process.env.REDIS_HOST || 'localhost',
-    port: process.env.REDIS_PORT || 6379
-  });
-
-  redisClient.on('error', (err) => {
-    console.error('Erro ao conectar ao Redis:', err);
-  });
-
-  redisClient.get = util.promisify(redisClient.get);
-  redisClient.set = util.promisify(redisClient.set);
-
-  return redisClient;
-}
 
 function formatDate(dateStr) {
   const [day, month, year] = dateStr.split('/');
@@ -53,7 +35,7 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   const query = `
     SELECT id, name, original_birth_date, mother_name 
     FROM "People" 
-    WHERE city_id = 4
+    WHERE city_id = 4 AND hydrating = true
     LIMIT ${limit} OFFSET ${offset};
   `;
 
@@ -119,31 +101,10 @@ async function updatePersonVoterData(personId, voterData) {
   }
 }
 
-async function fetchVoterDataWithCache(redisClient, name, birthDate, motherName) {
-  const cacheKey = `voter_data_${name}_${birthDate}_${motherName}`;
-
-  if (!redisClient || !redisClient.connected) {
-    console.error('Tentativa de usar cliente Redis que já está fechado!');
-    throw new Error('Redis client is closed or unavailable');
-  }
-
-  try {
-    const cachedData = await redisClient.get(cacheKey);
-    if (cachedData) {
-      console.log(`Dados de cache encontrados para ${name}`);
-      return JSON.parse(cachedData);
-    }
-    return null;
-  } catch (error) {
-    console.error(`Erro ao buscar ou salvar dados no cache para ${name}:`, error);
-    throw error;
-  }
-}
-
 async function createPuppeteerCluster() {
   const cluster = await Cluster.launch({
     concurrency: Cluster.CONCURRENCY_BROWSER,
-    maxConcurrency: 2,
+    maxConcurrency: 1, 
     puppeteerOptions: {
       headless: true,
       args: [
@@ -158,75 +119,60 @@ async function createPuppeteerCluster() {
       ],
     },
     monitor: true,
+    timeout: 180000,  
   });
 
-  await cluster.task(async ({ page, data: { redisClient, person, counts } }) => {
+  await cluster.task(async ({ page, data: { person, counts } }) => {
     const { id, name, original_birth_date: birthDate, mother_name: motherName } = person;
 
     try {
-      if (!redisClient || !redisClient.connected) {
-        console.error('Redis client já foi fechado ou não está conectado!');
-        throw new Error('Redis client not available');
-      }
-
-      const cachedData = await fetchVoterDataWithCache(redisClient, name, birthDate, motherName);
-
-      if (cachedData) {
-        console.log(`Dados de cache usados para ${name}`);
-        counts.success++;
-        await updatePersonVoterData(id, cachedData);  
-        return cachedData;
-      }
-
       console.log(`Processando ${name}...`);
 
-      await page.goto('https://www.tre-ce.jus.br/servicos-eleitorais/titulo-e-local-de-votacao/consulta-por-nome', {
+      await page.goto('https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/atendimento-eleitor/onde-votar', {
         waitUntil: 'networkidle2',
       });
 
-      const cienteButton = await page.$('button[title="Ciente"]');
-      if (cienteButton) {
-        await cienteButton.click();
-        console.log('Pop-up de cookies fechado.');
+      const ondeVotarButton = await page.$('button[aria-label="8. Onde votar"]');
+      if (ondeVotarButton) {
+        await page.evaluate(button => button.click(), ondeVotarButton);
+        console.log('Botão "8. Onde votar" clicado.');
+      } else {
+        throw new Error('Botão "8. Onde votar" não encontrado.');
       }
+
+      await page.waitForSelector('input[placeholder="Número do título eleitoral ou CPF ou nome"]');
+      console.log('Formulário de autenticação carregado.');
 
       const formattedBirthDate = formatDate(birthDate);
-      console.log(`Data de nascimento formatada: ${formattedBirthDate}`);
-
-      await page.waitForSelector('#LV_NomeTituloCPF', { visible: true, timeout: 5000 });
-      await page.type('#LV_NomeTituloCPF', name);
+      await page.type('input[placeholder="Número do título eleitoral ou CPF ou nome"]', name);
       console.log(`Nome preenchido: ${name}`);
 
-      await page.waitForSelector('#LV_DataNascimento', { visible: true, timeout: 5000 });
-      await page.type('#LV_DataNascimento', formattedBirthDate);
+      await page.type('input[placeholder="Data de nascimento (dia/mês/ano)"]', formattedBirthDate);
       console.log(`Data de nascimento preenchida: ${formattedBirthDate}`);
 
-      await page.waitForSelector('#LV_NomeMae', { visible: true, timeout: 5000 });
-      await page.type('#LV_NomeMae', motherName);
+      await page.type('input[placeholder="Nome da mãe"]', motherName);
       console.log(`Nome da mãe preenchido: ${motherName}`);
 
-      const submitButton = await page.$('#consultar-local-votacao-form-submit');
+      const submitButton = await page.$('button[type="submit"]');
       if (submitButton) {
-        await page.evaluate((button) => button.click(), submitButton);
-        console.log(`Submetendo formulário para ${name}`);
+        await page.evaluate(button => button.click(), submitButton);
+        console.log(`Formulário submetido para ${name}`);
       } else {
-        console.error(`Botão de submissão não encontrado para ${name}`);
-        counts.failure++;
-        return { error: 'Erro ao submeter formulário' };
+        throw new Error('Botão de submissão não encontrado');
       }
 
-      await page.waitForFunction(() => !document.body.innerText.includes('carregando conteúdo'), { timeout: 90000 });
+      await page.waitForFunction(() => !document.body.innerText.includes('carregando conteúdo'), { timeout: 120000 });
 
       if ((await page.$('div.alert.alert-warning')) !== null) {
-        console.log(`Pessoa não encontrada no sistema do TRE: ${name}`);
+        console.log(`Pessoa não encontrada no sistema do TSE: ${name}`);
         counts.failure++;
         return { error: 'Pessoa não encontrada' };
       }
 
       const data = await page.evaluate(() => {
         const extractZonaSecao = () => {
-          const element = Array.from(document.querySelectorAll('p')).find(
-            (el) => el.textContent.includes('Zona:') && el.textContent.includes('Seção:')
+          const element = Array.from(document.querySelectorAll('div.data-box')).find(
+            (el) => el.textContent.includes('Zona') && el.textContent.includes('Seção')
           );
           if (element) {
             const text = element.textContent;
@@ -241,42 +187,38 @@ async function createPuppeteerCluster() {
         };
 
         const getText = (label) => {
-          const element = Array.from(document.querySelectorAll('p')).find((el) => el.textContent.includes(label));
-          return element ? element.textContent.split(': ')[1].trim() : null;
-        };
-
-        const extractInscricao = () => {
-          const element = Array.from(document.querySelectorAll('p')).find((el) => el.textContent.includes('Inscrição:'));
+          const element = Array.from(document.querySelectorAll('div.data-box')).find((el) => el.textContent.includes(label));
           return element ? element.textContent.split(': ')[1].trim() : null;
         };
 
         const { zona, secao } = extractZonaSecao();
-        const inscricao = extractInscricao();
+        const inscricao = getText('Inscrição');
+        const local = getText('Local de votação');
+        const endereco = getText('Endereço');
+        const municipio = getText('Município/UF');
+        const biometria = document.body.innerText.includes('ELEITOR/ELEITORA COM BIOMETRIA COLETADA');
 
         return {
           inscricao,
           zona,
           secao,
-          local: getText('Local'),
-          endereco: getText('Endereço'),
-          municipio: getText('Município'),
-          biometria: document.body.innerText.includes('ELEITOR/ELEITORA COM BIOMETRIA COLETADA'),
+          local,
+          endereco,
+          municipio,
+          biometria,
         };
       });
 
       if (!data.inscricao) {
-        console.error(`Erro: Não foi possível extrair a inscrição para ${name}`);
-        counts.failure++;
-        return { error: 'Erro ao extrair inscrição' };
+        throw new Error('Erro ao extrair inscrição');
       }
 
-      await redisClient.set(`voter_data_${name}_${birthDate}_${motherName}`, JSON.stringify(data), 'EX', 3600);
       counts.success++;
-
       await updatePersonVoterData(id, data); 
       return data;
     } catch (error) {
       console.error(`Erro ao processar ${name}: ${error.message}`);
+      await page.screenshot({ path: `error_${name}.png`, fullPage: true }); 
       counts.failure++;
       return { error: error.message };
     }
@@ -342,14 +284,12 @@ async function createPuppeteerCluster() {
     console.log(`Processamento completo. Total de registros processados: ${totalProcessed}`);
     console.log(`Total com sucesso: ${totalSuccess}, total com falha: ${totalFailure}`);
   } else {
-    const redisClient = createRedisClient();
-
     process.on('message', async ({ people, counts }) => {
       const puppeteerCluster = await createPuppeteerCluster();
 
       try {
         for (const person of people) {
-          puppeteerCluster.queue({ redisClient, person, counts });
+          puppeteerCluster.queue({ person, counts });
         }
 
         await puppeteerCluster.idle();
@@ -357,9 +297,6 @@ async function createPuppeteerCluster() {
         console.error('Erro durante o processamento:', error);
       } finally {
         await puppeteerCluster.close();
-        if (redisClient && redisClient.connected) {
-          redisClient.quit();
-        }
         process.send({ success: counts.success, failure: counts.failure });
         process.exit(); 
       }
