@@ -3,6 +3,9 @@ const os = require('os');
 const cluster = require('cluster');
 require('dotenv').config();
 const { Client } = require('pg');
+const { normalize } = require('./normalize');
+const fs = require('fs');
+const path = require('path');
 
 function formatDate(dateStr) {
   const [day, month, year] = dateStr.split('/');
@@ -35,7 +38,7 @@ async function getPeopleFromDatabase(offset = 0, limit = 1000) {
   const query = `
     SELECT id, name, original_birth_date, mother_name 
     FROM "People" 
-    WHERE city_id = 4 AND hydrating = true
+    WHERE city_id = 4 AND hydrate
     LIMIT ${limit} OFFSET ${offset};
   `;
 
@@ -132,26 +135,28 @@ async function createPuppeteerCluster() {
         waitUntil: 'networkidle2',
       });
 
-      const ondeVotarButton = await page.$('button[aria-label="8. Onde votar"]');
-      if (ondeVotarButton) {
-        await page.evaluate(button => button.click(), ondeVotarButton);
-        console.log('Botão "8. Onde votar" clicado.');
+      await page.waitForSelector('.cookies .botao button', { visible: true, timeout: 5000 });
+      const cienteButton = await page.$('div.botao button.btn');
+      if (cienteButton) {
+        await cienteButton.click();
+        console.log('Pop-up de cookies fechado.');
       } else {
-        throw new Error('Botão "8. Onde votar" não encontrado.');
+        console.log('Botão "Ciente" não encontrado.');
       }
 
-      await page.waitForSelector('input[placeholder="Número do título eleitoral ou CPF ou nome"]');
-      console.log('Formulário de autenticação carregado.');
-
       const formattedBirthDate = formatDate(birthDate);
-      await page.type('input[placeholder="Número do título eleitoral ou CPF ou nome"]', name);
-      console.log(`Nome preenchido: ${name}`);
+      const normalizedName = normalize(name.toUpperCase());
+      const normalizedMotherName = normalize(motherName.toUpperCase());
+
+      // Preenchimento dos campos com normalize correto
+      await page.type('input[placeholder="Número do título eleitoral ou CPF ou nome"]', normalizedName);
+      console.log(`Nome preenchido: ${normalizedName}`);
 
       await page.type('input[placeholder="Data de nascimento (dia/mês/ano)"]', formattedBirthDate);
       console.log(`Data de nascimento preenchida: ${formattedBirthDate}`);
 
-      await page.type('input[placeholder="Nome da mãe"]', motherName);
-      console.log(`Nome da mãe preenchido: ${motherName}`);
+      await page.type('[formcontrolname=nomeMae]', normalizedMotherName);
+      console.log(`Nome da mãe preenchido: ${normalizedMotherName}`);
 
       const submitButton = await page.$('button[type="submit"]');
       if (submitButton) {
@@ -169,55 +174,70 @@ async function createPuppeteerCluster() {
         return { error: 'Pessoa não encontrada' };
       }
 
+      // Extração de dados adaptada conforme o segundo código
       const data = await page.evaluate(() => {
-        const extractZonaSecao = () => {
-          const element = Array.from(document.querySelectorAll('div.data-box')).find(
-            (el) => el.textContent.includes('Zona') && el.textContent.includes('Seção')
-          );
-          if (element) {
-            const text = element.textContent;
-            const zonaMatch = text.match(/Zona:\s*(\d+)/);
-            const secaoMatch = text.match(/Seção:\s*(\d+)/);
-            return {
-              zona: zonaMatch ? zonaMatch[1] : null,
-              secao: secaoMatch ? secaoMatch[1] : null,
-            };
+        // Verifica se o componente de dados do eleitor está presente
+        const voterComponent = document.querySelector('.componente-onde-votar');
+        if (!voterComponent) {
+          return {
+            error: true,
+            message: 'Pessoa não encontrada no sistema do TSE',
+          };
+        }
+
+        // Extrai os rótulos e descrições
+        const labels = Array.from(
+          document.querySelectorAll('.lado-ov .data-box .label'),
+        ).map((el) => el.textContent.trim());
+
+        const descs = Array.from(
+          document.querySelectorAll('.lado-ov .data-box .desc'),
+        ).map((el) => el.textContent.trim());
+
+        // Mapeia os rótulos para os campos correspondentes
+        const result = {};
+        const possibleLabels = {
+          'Local de votação': 'local',
+          'Endereço': 'endereco',
+          'Município/UF': 'municipio',
+          'Bairro': 'bairro',
+          'Seção': 'secao',
+          'Zona': 'zona',
+        };
+
+        labels.forEach((label, i) => {
+          const key = possibleLabels[label];
+          if (key) {
+            result[key] = descs[i] || null;
           }
-          return { zona: null, secao: null };
-        };
+        });
 
-        const getText = (label) => {
-          const element = Array.from(document.querySelectorAll('div.data-box')).find((el) => el.textContent.includes(label));
-          return element ? element.textContent.split(': ')[1].trim() : null;
-        };
+        // Verifica se a biometria foi coletada
+        result.biometria = document.body.innerText.includes(
+          'ELEITOR/ELEITORA COM BIOMETRIA COLETADA'
+        );
 
-        const { zona, secao } = extractZonaSecao();
-        const inscricao = getText('Inscrição');
-        const local = getText('Local de votação');
-        const endereco = getText('Endereço');
-        const municipio = getText('Município/UF');
-        const biometria = document.body.innerText.includes('ELEITOR/ELEITORA COM BIOMETRIA COLETADA');
-
-        return {
-          inscricao,
-          zona,
-          secao,
-          local,
-          endereco,
-          municipio,
-          biometria,
-        };
+        return { error: false, data: result };
       });
 
-      if (!data.inscricao) {
-        throw new Error('Erro ao extrair inscrição');
+      // Verificação e tratamento do resultado
+      if (data.error) {
+        const screenshotPath = path.join(
+          __dirname,
+          'rpa',
+          `pessoa_nao_encontrada_${name.replace(/\s+/g, '_')}.png`,
+        );
+        await page.screenshot({ path: screenshotPath });
+        throw new Error(data.message);
       }
-
+      
+      console.log(`Dados encontrados com sucesso: ${JSON.stringify(data.data)}`);
       counts.success++;
-      await updatePersonVoterData(id, data); 
-      return data;
+      await updatePersonVoterData(id, data.data);
+      return data.data;
     } catch (error) {
       console.error(`Erro ao processar ${name}: ${error.message}`);
+      console.log('Dados do caba mae, nome, data:', motherName, name, birthDate); // Log detalhado ao ocorrer erro
       await page.screenshot({ path: `error_${name}.png`, fullPage: true }); 
       counts.failure++;
       return { error: error.message };
