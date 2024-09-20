@@ -1,10 +1,9 @@
-const puppeteer = require('puppeteer');
 const { Client } = require('pg');
-const { normalize } = require('./normalize');
+const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-
-// Conexão direta com o banco de dados usando dados fornecidos
+const { normalize } = require('./normalize');
+const { formatDate, calculateAge, getPeopleFromDatabase } = require('./utils');
 const dbConfig = {
   user: 'zerooitocincoadm',
   host: 'zerooitocincodb.c5qnvtxpcnuu.us-east-1.rds.amazonaws.com',
@@ -12,222 +11,174 @@ const dbConfig = {
   password: 'GrzYTKeT3ZmSg4JfpnVqUYSd',
   port: 5432,
   ssl: {
-    rejectUnauthorized: false, // Ignora erros de certificado
+    rejectUnauthorized: false,
   },
 };
 
-// Função para formatar a data
-function formatDate(dateStr) {
-  const [day, month, year] = dateStr.split('/');
-  return `${day}/${month}/${year}`;
-}
-
-// Função para calcular a idade
-function calculateAge(birthDate) {
-  const [day, month, year] = birthDate.split('/');
-  const birth = new Date(`${year}-${month}-${day}`);
-  const ageDifMs = Date.now() - birth.getTime();
-  const ageDate = new Date(ageDifMs);
-  return Math.abs(ageDate.getUTCFullYear() - 1970);
-}
-
-// Função para buscar dados do banco de dados
-async function getPeopleFromDatabase(offset = 0, limit = 1000) {
-  const client = new Client(dbConfig);
-  await client.connect();
-  console.log(`Executando consulta SQL com offset ${offset} e limite ${limit}`);
-
-  const query = `
-    SELECT id, name, original_birth_date, mother_name 
-    FROM "People" 
-    WHERE city_id = 4 AND hydrate
-    LIMIT ${limit} OFFSET ${offset};
-  `;
-
-  const res = await client.query(query);
-  await client.end();
-
-  const filteredPeople = res.rows.filter((person) => {
-    const age = calculateAge(person.original_birth_date);
-    return age >= 16 && age <= 30;
-  });
-
-  return filteredPeople;
-}
-
-// Função para atualizar dados do eleitor no banco de dados
-async function updatePersonVoterData(personId, voterData) {
-  const client = new Client(dbConfig);
-  await client.connect();
-  console.log(`Atualizando dados de votação para a pessoa ID: ${personId}`);
-
-  const query = `
-    UPDATE "People"
-    SET titulo_eleitor = $1,
-        zona_eleitoral = $2,
-        secao_eleitoral = $3,
-        local_votacao = $4,
-        endereco_votacao = $5,
-        municipio_votacao = $6,
-        biometria = $7
-    WHERE id = $8
-  `;
-
-  const values = [
-    voterData.inscricao,
-    voterData.zona,
-    voterData.secao,
-    voterData.local,
-    voterData.endereco,
-    voterData.municipio,
-    voterData.biometria,
-    personId
-  ];
-
-  try {
-    await client.query(query, values);
-    console.log(`Dados de votação atualizados com sucesso para a pessoa ID: ${personId}`);
-  } catch (error) {
-    console.error(`Erro ao atualizar os dados de votação para a pessoa ID ${personId}:`, error);
-  } finally {
-    await client.end();
+class FetchVotersDataUseCase {
+  constructor() {
+    this.browser = null;
   }
-}
 
-// Função principal que cria o browser e executa o processo de scraping
-async function executeVoterDataProcess(person) {
-  const { id, name, original_birth_date: birthDate, mother_name: motherName } = person;
+  async initBrowser() {
+    console.log('Initializing browser');
+    this.browser = await puppeteer.launch({
+      args: [
+        '--no-sandbox',
+        '--disable-setuid-sandbox',
+        '--disable-dev-shm-usage',
+        '--disable-accelerated-2d-canvas',
+        '--no-first-run',
+        '--no-zygote',
+        '--disable-gpu',
+        '--incognito',
+      ],
+      headless: true, // Modo headless ativo para rodar em servidores
+      executablePath: '/usr/bin/chromium',
+    });
+    console.log('Browser successfully initialized');
+  }
 
-  const browser = await puppeteer.launch({
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-dev-shm-usage',
-      '--disable-accelerated-2d-canvas',
-      '--no-first-run',
-      '--no-zygote',
-      '--disable-gpu',
-      '--incognito',
-    ],
-    headless: true
-  });
+  async closeBrowser() {
+    if (this.browser) {
+      await this.browser.close();
+    }
+  }
 
-  const page = await browser.newPage();
+  async executeForAllPeople() {
+    try {
+      await this.initBrowser();
 
-  try {
-    await page.goto('https://www.tre-ce.jus.br/servicos-eleitorais/titulo-e-local-de-votacao/consulta-por-nome', {
-      waitUntil: 'domcontentloaded',
-      timeout: 120000,
+      let offset = 0;
+      const limit = 1000;
+      let people = [];
+
+      do {
+        people = await getPeopleFromDatabase(offset, limit);
+        console.log(`Pessoas obtidas da base de dados: ${people.length}`);
+
+        for (const person of people) {
+          console.log(`Processando dados de: ${person.name}`);
+          const result = await this.executeForPerson(person);
+          await this.updatePersonInDatabase(person.id, result);
+        }
+
+        offset += limit;
+      } while (people.length > 0);
+    } catch (error) {
+      console.error('Erro durante a execução:', error);
+    } finally {
+      await this.closeBrowser();
+    }
+  }
+
+  async executeForPerson({ id, name, original_birth_date, mother_name }) {
+    const formattedBirthDate = formatDate(original_birth_date);
+
+    const page = await this.browser.newPage();
+    page.on('request', (request) => {
+      console.log('URL:', request.url());
+      if (request.postData()) {
+        console.log('Payload:', request.postData());
+      }
     });
 
-    // Fechar pop-up de cookies
-    await page.waitForSelector('.cookies .botao button', { visible: true, timeout: 5000 });
-    const cienteButton = await page.$('div.botao button.btn');
-    if (cienteButton) await cienteButton.click();
-
-    const formattedBirthDate = formatDate(birthDate);
-    const normalizedName = normalize(name.toUpperCase());
-    const normalizedMotherName = normalize(motherName.toUpperCase());
-
-    // Preencher os campos do formulário
-    await page.type('input[placeholder="Número do título eleitoral ou CPF ou nome"]', normalizedName);
-    await page.type('input[placeholder="Data de nascimento (dia/mês/ano)"]', formattedBirthDate);
-    await page.type('[formcontrolname=nomeMae]', normalizedMotherName);
-
-    // Submeter o formulário
-    const submitButton = await page.$('button[type="submit"]');
-    if (submitButton) {
-      await page.evaluate(button => button.click(), submitButton);
-    } else {
-      throw new Error('Botão de submissão não encontrado');
-    }
-
-    // Espera para o carregamento do conteúdo
-    await page.waitForFunction(() => !document.body.innerText.includes('carregando conteúdo'), { timeout: 120000 });
-
-    if ((await page.$('div.alert.alert-warning')) !== null) {
-      console.log(`Pessoa não encontrada no sistema do TSE: ${name}`);
-      return { error: 'Pessoa não encontrada' };
-    }
-
-    // Aguardar tempo adicional para garantir o carregamento
-    await page.waitForTimeout(3000);
-
-    // Extrair dados da página
-    const data = await page.evaluate(() => {
-      const voterComponent = document.querySelector('.componente-onde-votar');
-      if (!voterComponent) {
-        return {
-          error: true,
-          message: 'Pessoa não encontrada no sistema do TSE',
-        };
-      }
-
-      const labels = Array.from(
-        document.querySelectorAll('.lado-ov .data-box .label'),
-      ).map((el) => el.textContent.trim() ?? null);
-
-      const descs = Array.from(
-        document.querySelectorAll('.lado-ov .data-box .desc'),
-      ).map((el) => el.textContent.trim() ?? null);
-
-      const result = {};
-      const possibleLabels = {
-        'Local de votação': 'local',
-        'Endereço': 'endereco',
-        'Município/UF': 'municipio',
-        'Bairro': 'bairro',
-        'Seção': 'secao',
-        'Zona': 'zona',
-      };
-
-      labels.forEach((label, i) => {
-        const key = possibleLabels[label];
-        if (key) {
-          result[key] = descs[i] || null;
-        }
+    try {
+      await page.goto('https://www.tre-ce.jus.br/servicos-eleitorais/titulo-e-local-de-votacao/consulta-por-nome', {
+        waitUntil: 'domcontentloaded',
+        timeout: 120000,
       });
 
-      result.biometria = document.body.innerText.includes(
-        'ELEITOR/ELEITORA COM BIOMETRIA COLETADA'
-      );
+      await page.waitForSelector('.cookies .botao button', { visible: true, timeout: 5000 });
+      const cienteButton = await page.$('div.botao button.btn');
+      if (cienteButton) await cienteButton.click();
 
-      return { error: false, data: result };
-    });
+      await page.waitForSelector('[formcontrolname=TituloCPFNome]', { visible: true, timeout: 5000 });
+      await page.type('[formcontrolname=TituloCPFNome]', normalize(name.toUpperCase()));
 
-    if (data.error) {
-      const screenshotPath = path.join(
-        __dirname,
-        'rpa',
-        `pessoa_nao_encontrada_${name.replace(/\s+/g, '_')}.png`,
-      );
+      await page.waitForSelector('[formcontrolname=dataNascimento]', { visible: true, timeout: 5000 });
+      await page.type('[formcontrolname=dataNascimento]', formattedBirthDate);
+
+      await page.waitForSelector('[formcontrolname=nomeMae]', { visible: true, timeout: 6000 });
+      await page.type('[formcontrolname=nomeMae]', normalize(mother_name.toUpperCase()));
+
+      await page.waitForSelector('.btn-tse', { visible: true, timeout: 6000 });
+      const button = await page.$('.btn-tse');
+      if (button) {
+        await button.click();
+      }
+
+      await new Promise((resolve) => setTimeout(resolve, 5000));
+
+      const data = await page.evaluate(() => {
+        const voterComponent = document.querySelector('.componente-onde-votar');
+        if (!voterComponent) {
+          return { error: true, message: 'Pessoa não encontrada no sistema do TRE' };
+        }
+
+        const labels = Array.from(document.querySelectorAll('.lado-ov .data-box .label')).map((el) => el.textContent.trim() ?? null);
+        const descs = Array.from(document.querySelectorAll('.lado-ov .data-box .desc')).map((el) => el.textContent.trim() ?? null);
+
+        const result = {};
+        const possibleLabels = {
+          'Local de votação': 'local',
+          Endereço: 'endereco',
+          'Município/UF': 'municipio',
+          Bairro: 'bairro',
+          Seção: 'secao',
+          País: 'pais',
+          Zona: 'zona',
+        };
+
+        labels.forEach((label, i) => {
+          const key = possibleLabels[label];
+          if (key) result[key] = descs[i] || null;
+        });
+
+        result.biometria = document.body.innerText.includes('ELEITOR/ELEITORA COM BIOMETRIA COLETADA');
+
+        return { error: false, data: result };
+      });
+
+      if (data.error) {
+        throw new Error(data.message);
+      }
+      return data.data;
+    } catch (error) {
+      console.error(`Erro ao processar ${name}:`, error.message);
+      const screenshotPath = path.join(__dirname, 'rpa', `erro_${name.replace(/\s+/g, '_')}.png`);
+      if (!fs.existsSync(path.join(__dirname, 'rpa'))) {
+        fs.mkdirSync(path.join(__dirname, 'rpa'), { recursive: true });
+      }
       await page.screenshot({ path: screenshotPath });
-      throw new Error(data.message);
+      throw error;
+    } finally {
+      await page.close();
     }
+  }
 
-    console.log(`Dados encontrados com sucesso: ${JSON.stringify(data.data)}`);
-    await updatePersonVoterData(id, data.data);
-    return data.data;
+  async updatePersonInDatabase(personId, data) {
+    const client = new Client(dbConfig);
+    await client.connect();
 
-  } catch (error) {
-    console.error(`Erro ao processar ${name}: ${error.message}`);
-    const screenshotPath = path.join(__dirname, 'rpa', `error_${name}.png`);
-    await page.screenshot({ path: screenshotPath });
-    throw error;
-  } finally {
-    await page.close();
-    await browser.close();
+    const query = `
+      UPDATE "People" 
+      SET voting_location = $1, updated_at = NOW() 
+      WHERE id = $2;
+    `;
+    const values = [JSON.stringify(data), personId];
+
+    try {
+      await client.query(query, values);
+      console.log(`Dados de ${personId} atualizados com sucesso.`);
+    } catch (error) {
+      console.error('Erro ao atualizar dados no banco de dados:', error);
+    } finally {
+      await client.end();
+    }
   }
 }
 
-// Executar o processo para buscar pessoas do banco de dados e processar
-(async function () {
-  const people = await getPeopleFromDatabase();
-  for (const person of people) {
-    try {
-      await executeVoterDataProcess(person);
-    } catch (error) {
-      console.error(`Erro no processamento do RPA para ${person.name}: ${error.message}`);
-    }
-  }
-})();
+// Inicializa e executa o processo
+const useCase = new FetchVotersDataUseCase();
+useCase.executeForAllPeople();
