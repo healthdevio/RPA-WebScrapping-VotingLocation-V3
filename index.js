@@ -129,12 +129,34 @@ async function createPuppeteerCluster() {
     const { id, name, original_birth_date: birthDate, mother_name: motherName } = person;
 
     try {
-      console.log(`Processando ${name}...`);
+      console.log(`==> HELLO WORLD FETCH VOTER DATA`);
 
-      await page.goto('https://www.tse.jus.br/servicos-eleitorais/autoatendimento-eleitoral#/atendimento-eleitor/onde-votar', {
-        waitUntil: 'networkidle2',
-        timeout: 120000,
+      if (!name || !birthDate || !motherName) {
+        throw new Error('Nome, data de nascimento e nome da mãe são obrigatórios.');
+      }
+
+      page.on('request', (request) => {
+        console.log('URL:', request.url());
+        console.log('Método:', request.method());
+        console.log('Cabeçalhos:', request.headers());
+        if (request.postData()) {
+          console.log('Payload:', request.postData());
+        }
+        console.log('-----');
       });
+
+      console.log('EM CIMA DO AWAIT Navegado para o site do TRE-CE.');
+      await page.goto(
+        'https://www.tre-ce.jus.br/servicos-eleitorais/titulo-e-local-de-votacao/consulta-por-nome',
+        {
+          waitUntil: 'domcontentloaded',
+          timeout: 120000,
+        }
+      );
+      console.log('Navegado para o site do TRE-CE.');
+
+      // Pausa para garantir que o conteúdo seja carregado
+      await new Promise((resolve) => setTimeout(resolve, 5000));
 
       await page.waitForSelector('.cookies .botao button', { visible: true, timeout: 5000 });
       const cienteButton = await page.$('div.botao button.btn');
@@ -145,63 +167,69 @@ async function createPuppeteerCluster() {
         console.log('Botão "Ciente" não encontrado.');
       }
 
+      const modalButton = await page.$('app-menu-option[title="8. Onde votar"]');
+      if (modalButton) {
+        await modalButton.click();
+        console.log('Modal do Formulário aberto.');
+      } else {
+        console.log('Botão "Onde votar" não encontrado.');
+      }
+
       const formattedBirthDate = formatDate(birthDate);
       const normalizedName = normalize(name.toUpperCase());
       const normalizedMotherName = normalize(motherName.toUpperCase());
 
-      await page.type('input[placeholder="Número do título eleitoral ou CPF ou nome"]', normalizedName);
+      // Log dos dados antes de submeter
+      console.log(`Submetendo dados da pessoa: 
+        Nome: ${normalizedName}, 
+        Data de Nascimento: ${formattedBirthDate}, 
+        Nome da Mãe: ${normalizedMotherName}`);
+
+      // Preenchendo o formulário com os dados da pessoa
+      await page.waitForSelector('[formcontrolname=TituloCPFNome]', { visible: true, timeout: 5000 });
+      await page.type('[formcontrolname=TituloCPFNome]', normalizedName);
       console.log(`Nome preenchido: ${normalizedName}`);
 
-      await page.type('input[placeholder="Data de nascimento (dia/mês/ano)"]', formattedBirthDate);
+      await page.waitForSelector('[formcontrolname=dataNascimento]', { visible: true, timeout: 5000 });
+      await page.type('[formcontrolname=dataNascimento]', formattedBirthDate);
       console.log(`Data de nascimento preenchida: ${formattedBirthDate}`);
 
+      await page.waitForSelector('[formcontrolname=nomeMae]', { visible: true, timeout: 6000 });
       await page.type('[formcontrolname=nomeMae]', normalizedMotherName);
       console.log(`Nome da mãe preenchido: ${normalizedMotherName}`);
 
-      const submitButton = await page.$('button[type="submit"]');
+      await page.waitForSelector('.btn-tse', { visible: true, timeout: 6000 });
+      const submitButton = await page.$('.btn-tse');
       if (submitButton) {
-        await page.evaluate(button => button.click(), submitButton);
-        console.log(`Formulário submetido para ${name}`);
+        await page.evaluate((b) => b.click(), submitButton);
+        console.log(`Submetendo formulário para: ${normalizedName}`);
       } else {
         throw new Error('Botão de submissão não encontrado');
       }
 
-      await page.waitForFunction(() => !document.body.innerText.includes('carregando conteúdo'), { timeout: 120000 });
-
-      if ((await page.$('div.alert.alert-warning')) !== null) {
-        console.log(`Pessoa não encontrada no sistema do TSE: ${name}`);
-        counts.failure++;
-        return { error: 'Pessoa não encontrada' };
-      }
-
-      // Adiciona espera para garantir que o conteúdo foi carregado
-      await page.waitForTimeout(3000); 
+      console.log('[FORM]: FORM submitted');
+      await new Promise((resolve) => setTimeout(resolve, 5000));
 
       const data = await page.evaluate(() => {
         const voterComponent = document.querySelector('.componente-onde-votar');
         if (!voterComponent) {
-          return {
-            error: true,
-            message: 'Pessoa não encontrada no sistema do TSE',
-          };
+          return { error: true, message: 'Pessoa não encontrada no sistema do TRE' };
         }
 
-        const labels = Array.from(
-          document.querySelectorAll('.lado-ov .data-box .label'),
-        ).map((el) => el.textContent.trim() ?? null);
-
-        const descs = Array.from(
-          document.querySelectorAll('.lado-ov .data-box .desc'),
-        ).map((el) => el.textContent.trim() ?? null);
+        const labels = Array.from(document.querySelectorAll('.lado-ov .data-box .label'))
+          .map((el) => el.textContent.trim() ?? null);
+        const descs = Array.from(document.querySelectorAll('.lado-ov .data-box .desc'))
+          .map((el) => el.textContent.trim() ?? null);
 
         const result = {};
         const possibleLabels = {
           'Local de votação': 'local',
-          'Endereço': 'endereco',
+          Endereço: 'endereco',
           'Município/UF': 'municipio',
-          'Bairro': 'bairro',
-          'Seção': 'secao',
-          'Zona': 'zona',
+          Bairro: 'bairro',
+          Seção: 'secao',
+          País: 'pais',
+          Zona: 'zona',
         };
 
         labels.forEach((label, i) => {
@@ -211,19 +239,18 @@ async function createPuppeteerCluster() {
           }
         });
 
-        result.biometria = document.body.innerText.includes(
-          'ELEITOR/ELEITORA COM BIOMETRIA COLETADA'
-        );
-
+        result.biometria = document.body.innerText.includes('ELEITOR/ELEITORA COM BIOMETRIA COLETADA');
         return { error: false, data: result };
       });
 
       if (data.error) {
-        const screenshotPath = path.join(
-          __dirname,
-          'rpa',
-          `pessoa_nao_encontrada_${name.replace(/\s+/g, '_')}.png`,
-        );
+        const screenshotPath = path.join(__dirname, 'rpa', `pessoa_nao_encontrada_${name.replace(/\s+/g, '_')}.png`);
+        
+        // Verifica se o diretório "rpa" existe, caso contrário, cria
+        if (!fs.existsSync(path.join(__dirname, 'rpa'))) {
+          fs.mkdirSync(path.join(__dirname, 'rpa'), { recursive: true });
+        }
+        
         await page.screenshot({ path: screenshotPath });
         throw new Error(data.message);
       }
@@ -232,12 +259,24 @@ async function createPuppeteerCluster() {
       counts.success++;
       await updatePersonVoterData(id, data.data);
       return data.data;
+
     } catch (error) {
       console.error(`Erro ao processar ${name}: ${error.message}`);
-      console.log('Dados do caba mae, nome, data:', motherName, name, birthDate); 
-      await page.screenshot({ path: `error_${name}.png`, fullPage: true }); 
+
+      const errorScreenshotPath = path.join(__dirname, 'rpa', `erro_${name.replace(/\s+/g, '_')}.png`);
+      
+      // Verifica se o diretório "rpa" existe, caso contrário, cria
+      if (!fs.existsSync(path.join(__dirname, 'rpa'))) {
+        fs.mkdirSync(path.join(__dirname, 'rpa'), { recursive: true });
+      }
+      
+      await page.screenshot({ path: errorScreenshotPath, fullPage: true });
+      console.log(`Screenshot do erro salvo em: ${errorScreenshotPath}`);
+      
       counts.failure++;
       return { error: error.message };
+    } finally {
+      await page.close();
     }
   });
 
@@ -320,3 +359,4 @@ async function createPuppeteerCluster() {
     });
   }
 })();
+
